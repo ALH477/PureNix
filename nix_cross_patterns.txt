@@ -1,0 +1,197 @@
+CROSS-COMPILATION PATTERNS
+
+Pattern 1: Multi-Architecture Flake with Conditional Logic
+
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
+      forAllSystems = f: builtins.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+    in {
+      packages = forAllSystems (pkgs: 
+        pkgs.callPackage ./my-package.nix {
+          # Conditional dependencies based on target architecture
+          isArm = pkgs.stdenv.hostPlatform.isAarch64 || pkgs.stdenv.hostPlatform.isArm;
+          isRiscv = pkgs.stdenv.hostPlatform.isRiscv64;
+        }
+      );
+    };
+}
+
+# my-package.nix
+{ stdenv, lib, isArm, isRiscv, ... }:
+stdenv.mkDerivation {
+  pname = "my-package";
+  version = "1.0";
+  
+  # Architecture-specific source selection
+  src = if isRiscv then
+    fetchurl { url = "mirror://riscv/my-package-1.0.tar.gz"; hash = "sha256-..."; }
+  else
+    fetchurl { url = "https://example.com/my-package-1.0.tar.gz"; hash = "sha256-..."; };
+  
+  # Architecture-specific build flags
+  CFLAGS = lib.concatStringsSep " " (
+    [ "-O2" "-DNDEBUG" ]
+    ++ lib.optional isArm "-march=armv8-a+crypto"
+    ++ lib.optional isRiscv "-march=rv64gc"
+  );
+  
+  # Architecture-specific dependencies
+  buildInputs = [ zlib ]
+    ++ lib.optional isArm openssl
+    ++ lib.optional isRiscv pkgsCross.riscv64-multiplatform.zlib;
+}
+
+Pattern 2: Fully Static ARM64 Binary with musl
+
+# default.nix
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.pkgsMusl.aarch64.stdenv.mkDerivation {
+  pname = "my-app";
+  version = "1.0";
+  src = ./.;
+  
+  # musl doesn't support all glibc features
+  # Patch configure scripts to avoid glibc-specific checks
+  postPatch = ''
+    substituteInPlace configure \
+      --replace "glibc" "musl" \
+      --replace "getentropy" "getrandom"
+  '';
+  
+  # Static linking flags
+  NIX_LDFLAGS = "-static";
+  hardeningDisable = [ "bindnow" ];  # musl doesn't support bindnow
+  
+  # Verify static linking in installPhase
+  installPhase = ''
+    mkdir -p $out/bin
+    cp my-app $out/bin/
+    if ! ldd $out/bin/my-app 2>&1 | grep -q "not a dynamic executable"; then
+      echo "ERROR: Binary is not statically linked!" >&2
+      exit 1
+    fi
+  '';
+}
+
+Result:
+  ldd ./result/bin/my-app  # "not a dynamic executable"
+  file ./result/bin/my-app # ELF 64-bit LSB executable, ARM aarch64, statically linked
+  # Runs on ANY ARM64 Linux system with kernel >= 4.4
+
+Pattern 3: Rust Cross-Compilation with Conditional Features
+
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
+      forAllSystems = f: builtins.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+    in {
+      packages = forAllSystems (pkgs: 
+        pkgs.rustPlatform.buildRustPackage rec {
+          pname = "my-rust-app";
+          version = "1.0.0";
+          src = ./.;
+          cargoLock = { lockFile = ./Cargo.lock; };
+          
+          # Architecture-specific cargo flags
+          cargoBuildFlags = 
+            if pkgs.stdenv.hostPlatform.isRiscv64 then "--no-default-features --features riscv"
+            else if pkgs.stdenv.hostPlatform.isAarch64 then "--features neon"
+            else "";
+        }
+      );
+    };
+}
+
+# lib.rs
+#[cfg(target_arch = "aarch64")]
+#[cfg(feature = "neon")]
+pub fn accelerate(data: &[f32]) -> Vec<f32> {
+    // NEON intrinsics
+    unsafe { neon_accelerate(data) }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[cfg(feature = "riscv")]
+pub fn accelerate(data: &[f32]) -> Vec<f32> {
+    // RISC-V vector extension
+    unsafe { riscv_vector_accelerate(data) }
+}
+
+NIXOS IMAGE PATTERNS
+
+Pattern 1: Minimal ARM64 SD Card Image (Raspberry Pi 4)
+
+# configuration.nix
+{ config, pkgs, ... }:
+{
+  # Target hardware
+  imports = [ <nixos-hardware/raspberry-pi/4> ];
+  
+  # Bootloader
+  boot.loader.raspberryPi.enable = true;
+  boot.loader.raspberryPi.version = 4;
+  boot.loader.raspberryPi.uboot.enable = false;  # Use Raspberry Pi firmware bootloader
+  
+  # Filesystems
+  fileSystems."/" = {
+    device = "/dev/mmcblk0p2";
+    fsType = "ext4";
+  };
+  fileSystems."/boot" = {
+    device = "/dev/mmcblk0p1";
+    fsType = "vfat";
+  };
+  
+  # Minimal system
+  environment.systemPackages = with pkgs; [ vim git htop ];
+  services.openssh.enable = true;
+  
+  # Headless operation
+  services.getty.autologinUser = "root";
+  networking.useDHCP = true;
+  
+  # Firmware
+  hardware.raspberry-pi."4".fkms-3d.enable = true;
+  hardware.enableRedistributableFirmware = true;
+}
+
+# Build command
+nix build .#nixosConfigurations.rpi4.config.system.build.sdImage
+sudo dd if=./result/sd-image.img of=/dev/sdX bs=4M status=progress
+
+Pattern 2: RISC-V QEMU Image with Custom Kernel
+
+# configuration.nix
+{ config, pkgs, ... }:
+{
+  # Target architecture
+  nixpkgs.localSystem.system = "x86_64-linux";
+  nixpkgs.crossSystem.system = "riscv64-linux";
+  
+  # Custom kernel with RISC-V specific options
+  boot.kernelPackages = pkgs.linuxPackagesFor (pkgs.linux_latest.override {
+    structuredExtraConfig = with pkgs.lib.kernel; {
+      # RISC-V specific options
+      RISCV_ISA_C = yes;    # Compressed instructions
+      RISCV_ISA_V = module; # Vector extension as module
+      RISCV_SBI = yes;      # Supervisor Binary Interface
+      
+      # Debugging options
+      DEBUG_INFO = no;
+      DEBUG_KERNEL = no;
+    };
+  });
+  
+  # Minimal system for QEMU
+  environment.systemPackages = with pkgs; [ vim git ];
+  services.openssh.enable = true;
+  
+  # QEMU-specific configuration
+ 
