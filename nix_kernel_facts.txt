@@ -1,0 +1,214 @@
+KERNEL FACTS (NixOS 25.11 / Linux 6.12)
+
+KERNEL VARIANTS IN NIXPKGS
+
+linuxPackages_latest
+  Version: 6.12.13 (as of Feb 2026)
+  Status: Latest stable kernel
+  Use case: General purpose, newest hardware support
+  Update frequency: Weekly updates with latest stable point releases
+
+linuxPackages_lts
+  Version: 6.6.25 LTS (long-term support)
+  Status: Maintained until Dec 2026
+  Use case: Production servers requiring stability
+  Update frequency: Monthly security updates only
+
+linuxPackages_hardened
+  Base: linux_latest with grsecurity-inspired patches
+  Features:
+    - Kernel Self Protection Project (KSPP) hardening
+    - Restrict /dev/mem and /dev/kmem access
+    - Harden module loading (modules_disabled=1 after boot)
+    - Restrict ptrace scope
+    - Harden /proc visibility
+  Tradeoffs: Slightly reduced performance; some debugging tools disabled
+
+linuxPackages_zen
+  Base: linux_latest with desktop/gaming optimizations
+  Features:
+    - BBR TCP congestion control
+    - MuQSS CPU scheduler (alternative to CFS)
+    - UKSM memory deduplication
+    - Fsync/fsync2 for Wine/Proton gaming
+  Use case: Desktop systems, gaming, low-latency audio
+
+linuxPackages_rt
+  Base: linux_latest with PREEMPT_RT patches
+  Features:
+    - Fully preemptible kernel (sub-millisecond latency)
+    - Threaded interrupt handlers
+    - Priority inheritance mutexes
+  Use case: Industrial control, robotics, audio production
+  Limitations: Slightly reduced throughput; not all drivers support RT
+
+linuxPackages_libre
+  Base: linux_latest with proprietary blobs removed
+  Certification: FSF-approved RYF (Respects Your Freedom)
+  Limitations: No support for hardware requiring proprietary firmware
+  Use case: Privacy/security focused systems; FSF compliance
+
+KERNEL CONFIGURATION SYSTEM
+
+Structured configuration (NixOS 21.11+)
+  boot.kernelConfig = ''
+    MY_DRIVER y
+    DEBUG_INFO n
+  '';
+  Translated to .config format during build
+  Advantages: Type-safe, composable, avoids string manipulation errors
+
+Legacy string configuration
+  boot.kernelConfig = ''
+    CONFIG_MY_DRIVER=y
+    CONFIG_DEBUG_INFO=n
+  '';
+  Still supported for complex configurations
+  Disadvantages: Error-prone, no validation
+
+Kernel patches
+  boot.kernelPatches = [
+    {
+      name = "my-patch";
+      patch = ./my-patch.patch;
+      extraConfig = "MY_FEATURE y";
+    }
+  ];
+  Applied in order during kernel build
+  Can include both patch files and config fragments
+
+MODULE SYSTEM
+
+Built-in vs modular
+  CONFIG_DRIVER=y → compiled into vmlinuz
+  CONFIG_DRIVER=m → loadable module in /run/current-system/kernel-modules
+  
+Module dependencies
+  Stored in /run/current-system/kernel-modules/lib/modules/<version>/modules.dep
+  Generated automatically by depmod during build
+  
+External modules
+  boot.extraModulePackages = [ pkgs.zfs pkgs.nvidia_x11 ];
+  Built against current kernel version
+  Must be rebuilt when kernel updates (handled automatically by NixOS)
+
+Firmware loading
+  hardware.firmware = [ pkgs.linux-firmware pkgs.rtl-sdr-firmware ];
+  Copied to /run/current-system/firmware during activation
+  Loaded by kernel on demand via firmware_class interface
+
+INITRD SYSTEM
+
+Purpose
+  Early userspace for mounting root filesystem
+  Contains essential drivers, cryptsetup, network tools
+  
+Contents determined by:
+  boot.initrd.availableKernelModules - drivers needed before root mount
+  boot.initrd.kernelModules - modules to load in initrd
+  boot.initrd.extraUtils - additional tools (cryptsetup, btrfs-progs)
+  
+Customization patterns
+  # Add cryptsetup for LUKS
+  boot.initrd.extraUtils = pkgs.makeInitrdUtils {
+    extraPackages = pkgs: [ pkgs.cryptsetup ];
+  };
+  
+  # Add network tools for netboot
+  boot.initrd.network.enable = true;
+  boot.initrd.network.ssh.enable = true;
+  
+Size optimization
+  boot.initrd.availableKernelModules = [ "ahci" "xhci_pci" "ext4" ];
+  # Only include essential drivers → smaller initrd (faster boot)
+
+SECURE BOOT IMPLEMENTATION
+
+Current status (NixOS 25.11)
+  Experimental support; not enabled by default
+  Requires manual key management and UEFI enrollment
+  
+Components
+  shim - Microsoft-signed bootloader (chainloads to systemd-boot)
+  systemd-boot - Signed with user key
+  Kernel - Signed with user key
+  initrd - Signed with user key
+  
+Workflow
+  1. Generate keys: sbctl create-keys
+  2. Build signed system: boot.signatures.enable = true
+  3. Clear UEFI key database (one-time)
+  4. Enroll PK, KEK, db keys via UEFI setup or sbctl
+  5. Boot signed image
+  
+Limitations
+  - No automatic key rotation
+  - Recovery requires physical access to clear keys
+  - Not all hardware supports custom key enrollment
+
+ARM-SPECIFIC KERNEL FACTS
+
+Device trees
+  Hardware description format replacing PCI enumeration
+  Compiled from .dts source to .dtb binary
+  Located in /run/current-system/kernel-modules/dtbs/
+  
+Device tree overlays
+  Runtime modification of device tree
+  Used for HATs on Raspberry Pi
+  boot.kernelParams = [ "fdt_overlay=${./my-overlay.dtbo}" ];
+  
+Bootloaders
+  Raspberry Pi: Proprietary GPU bootloader → start*.elf → kernel8.img
+  Allwinner: U-Boot loaded from SPI flash or SD card
+  Rockchip: U-Boot with vendor-specific extensions
+  
+Firmware requirements
+  Raspberry Pi: firmware package provides start*.elf, fixup.dat
+  Allwinner: ARM Trusted Firmware (ATF) for secure boot
+  Rockchip: vendor-specific miniloader + U-Boot
+
+RISC-V-SPECIFIC KERNEL FACTS
+
+Boot process
+  OpenSBI (Supervisor Binary Interface) → U-Boot → Kernel
+  OpenSBI provides firmware-like services to kernel
+  
+ISA extensions
+  I (base integer), M (multiply), A (atomic), F/D (float/double), C (compressed)
+  G = IMAFD (general purpose)
+  V = vector extension (experimental in Linux 6.12)
+  
+Kernel configuration
+  CONFIG_RISCV_ISA_C = compressed instructions (reduces code size 30%)
+  CONFIG_RISCV_ISA_V = vector extension (SIMD operations)
+  CONFIG_RISCV_SBI = Supervisor Binary Interface
+  
+Hardware support status (Linux 6.12)
+  SiFive Unmatched (FU740): Full support including PCIe, Ethernet
+  StarFive VisionFive 2: Mostly working; GPU acceleration missing
+  Allwinner NeZha (D1): Basic support; USB/Ethernet working
+  QEMU virt: Fully supported for development/testing
+
+CROSS-COMPILATION KERNEL FACTS
+
+Cross-building kernels
+  pkgs.pkgsCross.aarch64-multiplatform.linuxPackages_latest.kernel
+  Builds ARM64 kernel on x86_64 host
+  
+Toolchain requirements
+  Cross-GCC with target architecture support
+  Target binutils (assembler, linker)
+  Target headers (linux-headers package)
+  
+Device tree compilation
+  Requires dtc (device tree compiler) built for HOST architecture
+  Not cross-compiled - runs on build machine
+  
+Kernel module signing for cross targets
+  Requires sbctl built for HOST architecture
+  Signs modules after cross-compilation completes
+  
+Verification
+  file ./result/kernel  # Should show target architecture
+  readelf -h ./result/kernel | grep Machine  # Verify architecture
