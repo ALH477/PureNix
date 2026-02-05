@@ -1,0 +1,314 @@
+PYTHON PATTERNS
+
+Pattern 1: Reproducible Poetry Environment (Flake)
+
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    poetry2nix.url = "github:nix-community/poetry2nix";
+    poetry2nix.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { self, nixpkgs, poetry2nix }: 
+    let
+      system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
+      poetryEnv = poetry2nix.mkPoetryEnv {
+        projectDir = ./.;
+        python = pkgs.python312;
+      };
+    in {
+      devShells.default = pkgs.mkShell {
+        packages = [ poetryEnv pkgs.poetry pkgs.black pkgs.pytest ];
+        shellHook = ''
+          export PYTHONPATH=$(pwd)/src:$PYTHONPATH
+          echo "✓ Poetry environment ready with ${poetryEnv.python.pythonVersion}"
+        '';
+      };
+    };
+}
+
+Usage:
+  nix develop
+  poetry run pytest tests/  # Uses Nix-provided dependencies, not network
+
+Pattern 2: Production Python Application (Docker)
+
+# default.nix
+{ pkgs ? import <nixpkgs> {} }:
+let
+  pythonEnv = pkgs.python312.withPackages (ps: with ps; [ flask gunicorn ]);
+in pkgs.dockerTools.buildLayeredImage {
+  name = "myapp";
+  tag = "latest";
+  contents = [ pythonEnv ];
+  config = {
+    Cmd = [ "${pythonEnv}/bin/gunicorn" "--bind" "0.0.0.0:8000" "app:app" ];
+    ExposedPorts = { "8000/tcp" = { }; };
+  };
+  created = "1970-01-01T00:00:01Z";  # Fixed timestamp for reproducibility
+}
+
+Build:
+  nix-build -E 'with import <nixpkgs> {}; callPackage ./default.nix {}'
+  docker load < result
+
+C/C++ PATTERNS
+
+Pattern 1: Modern CMake Project with Dev Shell
+
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  outputs = { self, nixpkgs }:
+    let
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      myApp = pkgs.stdenv.mkDerivation {
+        pname = "my-app";
+        version = "1.0";
+        src = ./.;
+        nativeBuildInputs = [ pkgs.cmake pkgs.ninja ];
+        buildInputs = [ pkgs.openssl pkgs.zlib ];
+      };
+    in {
+      packages.default = myApp;
+      devShells.default = pkgs.mkShell {
+        packages = [
+          pkgs.clang
+          pkgs.cmake
+          pkgs.ninja
+          pkgs.gdb
+          pkgs.clang-tools  # For clangd LSP
+        ];
+        shellHook = ''
+          export CC=${pkgs.clang}/bin/clang
+          export CXX=${pkgs.clang}/bin/clang++
+          export LD_LIBRARY_PATH=${pkgs.openssl}/lib:${pkgs.zlib}/lib:$LD_LIBRARY_PATH
+          echo "✓ C/C++ toolchain ready: clang ${pkgs.clang.version}"
+        '';
+      };
+    };
+}
+
+Pattern 2: Fully Static musl Binary
+
+# default.nix
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.pkgsMusl.stdenv.mkDerivation {
+  pname = "my-app";
+  version = "1.0";
+  src = ./.;
+  nativeBuildInputs = [ pkgs.pkgsMusl.cmake ];
+  # No dynamic libraries required
+}
+
+Result:
+  ldd ./result/bin/my-app  # "not a dynamic executable"
+  ./result/bin/my-app      # Runs on any Linux system with kernel >= 3.0
+
+RUST PATTERNS
+
+Pattern 1: Cargo Project with Cross-Compilation
+
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      forAllSystems = f: builtins.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+    in {
+      packages = forAllSystems (pkgs: pkgs.rustPlatform.buildRustPackage {
+        pname = "my-app";
+        version = "1.0.0";
+        src = ./.;
+        cargoLock = {
+          lockFile = ./Cargo.lock;
+        };
+      });
+      devShells.default = (nixpkgs.legacyPackages.x86_64-linux).mkShell {
+        packages = [
+          (nixpkgs.legacyPackages.x86_64-linux.rust-bin.stable.latest.default)
+          nixpkgs.legacyPackages.x86_64-linux.cargo-audit
+          nixpkgs.legacyPackages.x86_64-linux.rust-analyzer
+        ];
+        shellHook = ''
+          export RUST_SRC_PATH=${nixpkgs.legacyPackages.x86_64-linux.rust-bin.stable.latest.default}/lib/rustlib/src/rust/library
+        '';
+      };
+    };
+}
+
+Cross-build:
+  nix build .#packages.aarch64-linux.my-app
+  file ./result/bin/my-app  # ARM64 binary
+
+Pattern 2: WASM Compilation
+
+# shell.nix
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.mkShell {
+  packages = [
+    (pkgs.rust-bin.stable.latest.minimal.withComponents [ "rustc" "cargo" "rust-std" ])
+    pkgs.wasm-bindgen-cli
+    pkgs.wasm-pack
+  ];
+  RUST_TARGET_PATH = "${pkgs.rust-bin.stable.latest.minimal}/lib/rustlib";
+  shellHook = ''
+    rustup target add wasm32-unknown-unknown 2>/dev/null || true
+  '';
+}
+
+GO PATTERNS
+
+Pattern 1: Go Module with Vendoring
+
+# default.nix
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.buildGoModule {
+  pname = "my-app";
+  version = "1.0.0";
+  src = ./.;
+  vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  # vendorHash obtained via: nix build -f . my-app --hash-only
+}
+
+Obtain vendorHash:
+  nix-build -E 'with import <nixpkgs> {}; buildGoModule { pname="temp"; version="1"; src=./.; }' --dry-run 2>&1 | grep vendorHash
+
+Pattern 2: Fully Static Binary for AWS Lambda
+
+# default.nix
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.pkgsMusl.buildGoModule {
+  pname = "lambda-handler";
+  version = "1.0.0";
+  src = ./.;
+  CGO_ENABLED = "0";  # Critical for static binary
+  ldflags = "-s -w";  # Strip debug symbols
+}
+
+Result:
+  ldd ./result/bin/lambda-handler  # "not a dynamic executable"
+  zip lambda.zip ./result/bin/lambda-handler
+  aws lambda update-function-code --function-name my-func --zip-file fileb://lambda.zip
+
+JAVASCRIPT PATTERNS
+
+Pattern 1: Node2nix for Reproducible NPM
+
+Workflow:
+  1. Commit package-lock.json to repo
+  2. Generate Nix expressions:
+       nix-shell -p node2nix --run "node2nix -i package-lock.json -o node-packages.nix -c node-composition.nix -d default.nix"
+  3. Build:
+       nix-build -A package
+
+Pattern 2: Next.js Production Build
+
+# default.nix
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.buildNpmPackage {
+  pname = "my-next-app";
+  version = "1.0.0";
+  src = ./.;
+  npmDepsHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  buildPhase = ''
+    runHook preBuild
+    npm run build
+    runHook postBuild
+  '';
+  installPhase = ''
+    runHook preInstall
+    mkdir -p $out/share/app
+    cp -r .next/static $out/share/app/
+    cp -r public $out/share/app/
+    cp next.config.mjs $out/share/app/
+    runHook postInstall
+  '';
+}
+
+Result:
+  ./result/share/app contains static assets ready for nginx serving
+
+LISP/EMACS PATTERNS
+
+Pattern 1: Declarative Emacs Configuration with Home Manager
+
+# home.nix
+{ pkgs, ... }:
+{
+  programs.emacs = {
+    enable = true;
+    package = pkgs.emacsPgtk;
+    extraPackages = epkgs: [
+      epkgs.melpaPackages.slime
+      epkgs.melpaPackages.magithub
+      epkgs.melpaPackages.direnv
+    ];
+  };
+
+  home.file.".emacs.d/init.el".text = ''
+    (require 'package)
+    (setq package-enable-at-startup nil)
+    (package-initialize)
+
+    ;; SLIME configuration
+    (setq inferior-lisp-program "sbcl")
+    (slime-setup '(slime-fancy))
+  '';
+}
+
+Activation:
+  home-manager switch
+  emacs  # Launches with pre-installed packages
+
+Pattern 2: SLIME Development Environment
+
+# shell.nix
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.mkShell {
+  packages = [
+    pkgs.sbcl
+    (pkgs.emacsPackagesNg.customEmacsWith (epkgs: [
+      epkgs.melpaPackages.slime
+      epkgs.melpaPackages.slime-company
+    ]))
+  ];
+  shellHook = ''
+    echo "✓ SLIME environment ready"
+    echo "  Launch Emacs: emacs -nw"
+    echo "  Within Emacs: M-x slime"
+  '';
+}
+
+Usage:
+  nix-shell
+  emacs -nw
+  M-x slime  # Starts SBCL inferior process with proper paths
+
+Pattern 3: Common Lisp Application Bundle
+
+# default.nix
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.sbcl.withPackages (ps: [
+  ps.alexandria
+  ps.bordeaux-threads
+  ps.clack
+  ps.hunchentoot
+]).overrideAttrs (old: {
+  installPhase = old.installPhase + ''
+    # Create launcher script
+    mkdir -p $out/bin
+    cat > $out/bin/my-web-app <<EOF
+    #!${pkgs.runtimeShell}
+    export SBCL_HOME=${pkgs.sbcl}/lib/sbcl
+    exec ${pkgs.sbcl}/bin/sbcl --load $out/lib/my-app/main.lisp
+    EOF
+    chmod +x $out/bin/my-web-app
+  '';
+})
+
+Result:
+  ./result/bin/my-web-app  # Standalone launcher with all dependencies
