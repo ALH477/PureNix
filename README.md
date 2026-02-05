@@ -1,4 +1,4 @@
-# PureNix: Nix Ecosystem Expert for Granite3 MoE
+# DeMoD Nix Assistant: Nix Ecosystem Expert for Ollama agents.
 
 This repository provides training data to fine-tune IBM's Granite3 MoE model as a specialized assistant for the Nix ecosystem (Nix package manager, NixOS, nixpkgs, and flakes). The dataset emphasizes production-grade patterns, security practices, and deep technical knowledge current as of February 2026.
 
