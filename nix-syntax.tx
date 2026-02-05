@@ -1,0 +1,277 @@
+NIX LANGUAGE SYNTAX REFERENCE (Nix 2.26)
+
+ATTRSETS
+
+Basic syntax:
+  { name = "value"; version = "1.0"; }
+
+Nested attrsets:
+  { services = { nginx = { enable = true; port = 8080; }; }; }
+  Access via attribute path: config.services.nginx.enable
+
+Recursive attrsets (self-reference):
+  rec { a = 1; b = a + 1; }  # 'a' visible within same scope
+
+Inheritance (extend existing attrset):
+  base = { x = 1; y = 2; };
+  extended = base // { z = 3; };  # → { x = 1; y = 2; z = 3; }
+
+Conditional attributes:
+  options = {
+    enable ? false,
+    port ? 8080,
+  } // (if options.enable then { actualPort = options.port; } else {});
+
+Dynamic attribute names:
+  let name = "dynamic"; in { ${name} = 1; }  # → { dynamic = 1; }
+
+Optional attribute access (avoid errors):
+  config.services.?nginx.?enable or false  # Returns false if nginx or enable missing
+
+Critical properties:
+  - Evaluation is LAZY - values computed only when accessed
+  - Order irrelevant - Nix attrsets are unordered collections
+  - Lookup complexity: O(log n) via sorted vector
+  - NEVER use 'with pkgs;' - breaks reproducibility, causes name collisions
+
+ANTI-PATTERN: with statements
+  with pkgs; [ python3 nodejs ]  # DANGEROUS - implicit scope injection
+  # Causes name collisions, breaks tooling, rejected by nixpkgs maintainers
+  # SAFE alternative: [ pkgs.python3 pkgs.nodejs ]
+
+LISTS
+
+Basic syntax:
+  [ 1 2 3 ]  # NO commas between elements
+  [ "a" "b" "c" ]
+  [ pkgs.python3 pkgs.nodejs 42 ]  # Heterogeneous lists allowed
+
+List concatenation:
+  [ 1 2 ] ++ [ 3 4 ]  # → [ 1 2 3 4 ]
+  # Creates NEW list - O(n) operation
+  # Repeated concatenation in loops causes O(n²) behavior
+
+Functional operations:
+  map (x: x * 2) [ 1 2 3 ]        # → [ 2 4 6 ]
+  filter (x: x > 2) [ 1 2 3 4 ]   # → [ 3 4 ]
+  builtins.elemAt [ 1 2 3 ] 1     # → 2 (O(n) lookup)
+  builtins.length [ 1 2 3 ]       # → 3
+
+Lazy evaluation:
+  let expensive = builtins.trace "EVAL" 42;
+      lst = [ 1 expensive 3 ];
+  in builtins.elemAt lst 0  # → 1 (no trace output - element not evaluated)
+
+Infinite lists:
+  let ones = 1 : ones; in builtins.elemAt ones 1000000  # Works due to laziness
+
+Critical pitfalls:
+  - NO commas allowed: [1, 2, 3] is INVALID syntax
+  - ++ creates new list - not in-place mutation
+  - elemAt is O(n) - avoid in hot loops for large lists
+  - Lazy evaluation can cause space leaks if thunks accumulate
+
+STRINGS
+
+Double-quoted strings:
+  "value: ${x}"                   # Interpolation
+  "newline: \n tab: \t quote: \"" # Standard escaping
+  "path: ${./.}"                  # Path coercion → "/home/user/project"
+
+Indented strings (multi-line):
+  ''
+    Line 1
+      Line 2 (preserves relative indent)
+    Line 3
+  ''
+  # → "Line 1\n  Line 2 (preserves relative indent)\nLine 3\n"
+  # NO escaping - backslash always literal
+  # ''${ produces literal ${ (not interpolation)
+  # Strips common leading whitespace up to first non-empty line
+
+Path coercion rules:
+  "${./.}"          → "/home/user/project" (absolute path)
+  "${pkgs.bash}"    → "/nix/store/...-bash-5.2" (store path)
+  "${123}"          → "123" (number → string)
+  "${true}"         → "1" (boolean → "1" or "0")
+
+Critical footguns:
+  - Path concatenation loses reference tracking:
+      bad = "/nix/store/" + hash + "-bash"  # Plain string - NO store path reference
+      good = "/nix/store/${hash}-bash"      # Preserves path properties
+  - String context leakage:
+      s = "${pkgs.bash}/bin" carries hidden reference to pkgs.bash
+      Context preserved through operations: s2 = s + " --version" still has context
+      Context stripped by builtins.toString s → plain string
+      Security risk: pname = "app-${secret}" leaks secret into store path
+
+FUNCTIONS
+
+Fundamental form (single parameter):
+  arg: arg * 2
+
+Attrset pattern matching (idiomatic multi-param):
+  { a, b }: a + b                 # Required attributes
+  { a, b ? 10 }: a + b            # Default argument
+  { a, b ? null }: if b != null then a + b else a  # Optional argument
+  args@{ a, b ? 10 }: { sum = a + b; original = args }  # @-pattern binds entire attrset
+  { a, b, ... }: a + b            # Variadic - ignores extra attributes
+
+Recursive functions:
+  let factorial = n: if n <= 1 then 1 else n * factorial (n - 1);
+  in factorial 5  # → 120
+
+Critical properties:
+  - Nix functions ALWAYS take exactly ONE parameter
+  - Multi-parameter via attrset destructuring
+  - Default arguments evaluated LAZILY
+  - Missing required attr → evaluation error: "attribute 'b' missing"
+  - No tail call optimization - deep recursion hits stack limit (~10,000 frames)
+
+LET/IN EXPRESSIONS
+
+Basic syntax:
+  let a = 1; b = a + 1; in b * 2  # → 4
+
+Nested let:
+  let x = 1;
+      y = let z = 2; in x + z;
+  in y  # → 3
+
+Recursion in let bindings:
+  let factorial = n: if n <= 1 then 1 else n * factorial (n - 1);
+  in factorial 5  # → 120
+
+Critical properties:
+  - Bindings evaluated LAZILY - only when accessed
+  - Inner bindings shadow outer bindings lexically
+  - Forward references illegal: let a = b + 1; b = 2; in a → error
+  - Mutual recursion allowed via functions: let a = x: b x + 1; b = x: x * 2; in a 3
+
+ATTRSET VS LET SCOPING
+  { a = 1; b = a + 1; }  # Error - attrset bindings not visible to each other
+  rec { a = 1; b = a + 1; }  # → { a = 1; b = 2; } - 'rec' enables self-reference
+
+OPERATORS
+
+Arithmetic:
+  +  -  *  /  # Standard arithmetic
+  Built-in functions: builtins.add, builtins.sub, builtins.mul, builtins.div
+
+Comparison:
+  == != < <= > >=
+  Built-in functions: builtins.lessThan, builtins.greaterThan
+
+Boolean:
+  && || !
+  Note: Any non-zero number or non-empty string is truthy
+
+String concatenation:
+  "a" + "b" → "ab"
+  "value: " + toString 42 → "value: 42"
+  Path interpolation preferred over concatenation for store paths
+
+List concatenation:
+  [1 2] ++ [3 4] → [1 2 3 4]
+  O(n) operation - creates new list
+
+Attrset merge:
+  { a = 1; } // { b = 2; } → { a = 1; b = 2; }
+  O(n) operation - creates new attrset
+  Later keys override earlier keys
+
+Type checking:
+  builtins.isInt 42 → true
+  builtins.isString "x" → true
+  builtins.isList [1] → true
+  builtins.isAttrs { } → true
+  builtins.isFunction (x: x) → true
+
+BUILT-IN FUNCTIONS (PURE)
+
+Arithmetic:
+  builtins.add 1 2 → 3
+  builtins.sub 5 3 → 2
+  builtins.mul 2 3 → 6
+  builtins.div 10 2 → 5
+
+Comparison:
+  builtins.lessThan 1 2 → true
+  builtins.greaterThan 3 2 → true
+
+Lists:
+  builtins.elemAt [1 2 3] 1 → 2
+  builtins.length [1 2 3] → 3
+  builtins.head [1 2 3] → 1
+  builtins.tail [1 2 3] → [2 3]
+  builtins.map (x: x*2) [1 2 3] → [2 4 6]
+  builtins.filter (x: x>2) [1 2 3] → [3]
+  builtins.foldl' (acc: x: acc+x) 0 [1 2 3] → 6
+
+Attrsets:
+  builtins.attrNames { a = 1; b = 2; } → [ "a" "b" ]
+  builtins.getAttr "a" { a = 1; } → 1
+  builtins.hasAttr "a" { a = 1; } → true
+
+Paths:
+  builtins.path { path = ./src; } → /nix/store/...-source
+  builtins.toString /etc/hosts → "/etc/hosts"
+  builtins.baseNameOf "/path/to/file" → "file"
+  builtins.dirOf "/path/to/file" → "/path/to"
+
+Debugging:
+  builtins.trace "msg" 42 → logs "msg" during eval, returns 42
+  builtins.seq x y → evaluates x, returns y (strictness operator)
+  builtins.deepSeq x y → recursively forces x, returns y
+
+BUILT-IN FUNCTIONS (IMPURE - SECURITY BOUNDARY)
+
+builtins.currentTime          # Unix timestamp (changes every second)
+builtins.getEnv "HOME"        # Reads process environment
+builtins.fetchurl { ... }     # Downloads from network DURING EVALUATION
+builtins.fetchGit { ... }     # Clones Git repo DURING EVALUATION
+builtins.readFile "/etc/passwd"  # Reads arbitrary file DURING EVALUATION
+
+Critical security properties:
+  - Impure built-ins execute during EVALUATION (unsandboxed)
+  - Break reproducibility - outputs change between evaluations
+  - NEVER use in packages - only in development shells or imperative scripts
+  - Hydra build machines run with pure-eval = true - impure built-ins fail there
+
+Safe patterns for network access:
+  - Defer to build phase: buildPhase = '' curl https://... '';
+  - Use fixed-output derivations: src = fetchurl { url = ...; sha256 = "..."; };
+  - Pin exact versions/commits - never use floating references (master, latest)
+
+EVALUATION ORDER
+
+Argument evaluation: STRICT (left to right)
+  let f = a: b: a + b;
+      x = trace "x" 1;
+      y = trace "y" 2;
+  in f x y
+  # Output: trace: x / trace: y / Result: 3
+
+Function body evaluation: LAZY (only when result needed)
+  let f = a: b: trace "body" (a + b);
+      x = f 1 2;
+  in 42  # → 42 (body never evaluated)
+
+Attrset value evaluation: LAZY
+  let s = { a = trace "a" 1; b = trace "b" 2; };
+  in s.a  # → trace: a → 1 (b never evaluated)
+
+List element evaluation: LAZY
+  let lst = [ (trace "0" 0) (trace "1" 1) ];
+  in builtins.elemAt lst 0  # → trace: 0 → 0 (element 1 not evaluated)
+
+Strictness operators:
+  builtins.seq x y    # Evaluates x, returns y
+  builtins.deepSeq x y  # Recursively forces x, returns y
+
+Space leak prevention:
+  # Accumulates thunks → OOM
+  sum = lst: foldl' (acc: x: acc + x) 0 lst
+  
+  # Fixed - force intermediate results
+  sum = lst: foldl' (acc: x: seq (acc + x) (acc + x)) 0 lst
