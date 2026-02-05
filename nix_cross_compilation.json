@@ -1,0 +1,291 @@
+{
+  "metadata": {
+    "version_context": "Nix 2.26.4 | NixOS 25.11 'Xantusia' | February 2026",
+    "supported_targets": [
+      "aarch64-linux (ARM64)",
+      "armv7l-linux (ARM32 hard-float)",
+      "riscv64-linux (RISC-V 64-bit)",
+      "riscv32-linux (RISC-V 32-bit, limited support)",
+      "mips64-linux (MIPS64, legacy)",
+      "powerpc64le-linux (POWER9/10)"
+    ],
+    "critical_principle": "Cross-compilation requires solving the libc selection problem: target binaries link against TARGET libc while build tools run on HOST libc"
+  },
+  "cross_toolchains": {
+    "pkgsCross_architecture": {
+      "structure": "pkgs.pkgsCross.<target-system>.<package>",
+      "examples": [
+        "pkgs.pkgsCross.aarch64-multiplatform.stdenv - ARM64 stdenv",
+        "pkgs.pkgsCross.riscv64-multiplatform.stdenv - RISC-V 64-bit stdenv",
+        "pkgs.pkgsCross.armv7l-multiplatform.stdenv - ARM32 hard-float stdenv"
+      ],
+      "libc_handling": "Target binaries link against target libc; build tools use host libc via pkgsCross.<target>.buildPackages",
+      "toolchain_components": [
+        "stdenv - Cross compiler targeting <target>",
+        "gcc - Cross GCC (e.g., aarch64-unknown-linux-gnu-gcc)",
+        "binutils - Cross assembler/linker",
+        "glibc - Target C library (for dynamic linking)",
+        "buildPackages - Host packages needed during build (cmake, python, etc.)"
+      ]
+    },
+    "musl_toolchains": {
+      "purpose": "Fully static binaries without dynamic linker dependencies",
+      "structure": "pkgs.pkgsMusl.<target> or pkgs.pkgsCross.<target>.pkgsMusl",
+      "examples": [
+        "pkgs.pkgsMusl.aarch64 - ARM64 musl toolchain",
+        "pkgs.pkgsMusl.riscv64 - RISC-V 64-bit musl toolchain"
+      ],
+      "advantage": "Single binary runs on any Linux system with compatible kernel",
+      "limitation": "Some packages fail to build with musl (glibc-specific assumptions)"
+    },
+    "bootstrap_process": {
+      "stage0": "Pre-built cross-binutils from trusted source (SHA-256 verified)",
+      "stage1": "Cross-GCC built using stage0 binutils + host GCC",
+      "stage2": "Target glibc built using cross-GCC",
+      "stage3": "Production cross-toolchain built using stage2 components",
+      "verification": "Hydra builds stage1 on multiple machines; output hashes must match bit-for-bit (91% reproducibility rate)",
+      "trust_model": "Stage0 binaries trusted; stage1+ verified via reproducibility checks"
+    }
+  },
+  "cross_compilation_patterns": {
+    "c_cpp": {
+      "basic_pattern": {
+        "derivation": "pkgs.pkgsCross.aarch64-multiplatform.stdenv.mkDerivation { ... }",
+        "configure_flags": "configureFlags = [ \"--host=${stdenv.targetPlatform.config}\" ];",
+        "build_inputs": "buildInputs = [ pkgs.pkgsCross.aarch64-multiplatform.glibc ];",
+        "native_build_inputs": "nativeBuildInputs = [ pkgs.pkgsCross.aarch64-multiplatform.buildPackages.cmake ];"
+      },
+      "cmake_pattern": {
+        "cmake_flags": "cmakeFlags = [ \"-DCMAKE_SYSTEM_NAME=Linux\" \"-DCMAKE_SYSTEM_PROCESSOR=aarch64\" ];",
+        "toolchain_file": "Can generate CMake toolchain file via pkgs.pkgsCross.aarch64-multiplatform.stdenv.cmake"
+      },
+      "meson_pattern": {
+        "cross_file": "mesonCrossFile = pkgs.writeText \"cross-file\" \"\"\"\n[binaries]\nc = '${pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc}/bin/aarch64-unknown-linux-gnu-gcc'\ncpp = '${pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc}/bin/aarch64-unknown-linux-gnu-g++'\n\"\"\";"
+      }
+    },
+    "rust": {
+      "native_support": "Rust has excellent cross-compilation via --target",
+      "pattern": "cargoBuildFlags = \"--target ${stdenv.hostPlatform.rust.rustcTarget}\";",
+      "std_libraries": "rust-bin includes pre-built std libraries for common targets (aarch64-unknown-linux-gnu, riscv64gc-unknown-linux-gnu)",
+      "proc_macro_challenge": "Build scripts (build.rs) and proc-macros compile for HOST but generate code for TARGET",
+      "solution": "Use cargo-cpuid or conditional compilation to handle architecture-specific code generation"
+    },
+    "go": {
+      "native_support": "Go has excellent cross-compilation via GOOS/GOARCH",
+      "pattern": "NIX_GOOS = \"linux\"; NIX_GOARCH = \"arm64\";",
+      "cgo_limitation": "CGO cross-compilation requires cross toolchain: CGO_ENABLED=1 CC=pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc",
+      "pure_go": "CGO_ENABLED=0 produces fully static binaries without cross toolchain"
+    },
+    "python": {
+      "status": "Limited support - Python bytecode portable but native extensions require cross toolchain",
+      "pattern": "python.pkgsCross.aarch64-multiplatform.buildPythonPackage",
+      "challenge": "setup.py often makes host-platform assumptions (e.g., uname detection)",
+      "solution": "Patch setup.py or use environment variables to force target platform"
+    },
+    "javascript": {
+      "status": "Pure JS portable; native addons (node-gyp) require cross toolchain",
+      "pattern": "nodePackages.buildNodePackage with pkgsCross for native addons",
+      "pure_js": "No cross-compilation needed - same JS runs on all platforms"
+    }
+  },
+  "testing_cross_binaries": {
+    "qemu_user_mode": {
+      "command": "qemu-aarch64 -L ${pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc.libc} ./result/bin/my-app",
+      "purpose": "Execute ARM64 binary on x86_64 host",
+      "limitations": [
+        "Performance overhead (2-5x slowdown)",
+        "Cannot test kernel interactions or hardware-specific behavior",
+        "Signal handling differences may cause subtle bugs"
+      ],
+      "libc_requirement": "Must provide target libc via -L flag (from pkgsCross toolchain)"
+    },
+    "qemu_system_mode": {
+      "purpose": "Full system emulation for integration testing",
+      "nixos_qemu": "nixos-shell or nixos-generate -f qcow --system aarch64-linux",
+      "workflow": "Build NixOS image for target → boot in QEMU → run integration tests",
+      "performance": "Very slow (10-100x slowdown) but tests full system behavior"
+    },
+    "remote_hardware": {
+      "pattern": "nix copy --to ssh://user@arm-device /nix/store/...-my-app",
+      "purpose": "Deploy to physical ARM/RISC-V hardware for final validation",
+      "automation": "Hydra or custom CI can push builds to test farm"
+    }
+  },
+  "cross_compilation_pitfalls": [
+    "FFI boundaries: Native extensions assume host platform during configuration",
+    "Build scripts with uname detection: Must patch or override via environment variables",
+    "Filesystem case sensitivity: ARM/RISC-V often use case-sensitive FS; x86 dev machines may not",
+    "Endianness issues: RISC-V can be little or big endian; most toolchains assume little-endian",
+    "Atomic operation assumptions: ARM32 requires explicit memory barriers for atomics",
+    "Unaligned memory access: ARM/RISC-V may fault on unaligned accesses that x86 tolerates",
+    "Toolchain path assumptions: Hardcoded /usr/bin/gcc breaks in cross environment"
+  ],
+  "nixos_image_types": {
+    "iso_minimal": {
+      "purpose": "Installer ISO for bare metal",
+      "command": "nix build .#nixosConfigurations.my-host.config.system.build.isoMinimal",
+      "output": "result/iso/minimal.iso (300-500MB)",
+      "contents": "Minimal NixOS with installer script, no desktop environment",
+      "customization": "Add packages via isoAdditionalPackages option"
+    },
+    "iso_graphical": {
+      "purpose": "Live desktop ISO with installer",
+      "command": "nix build .#nixosConfigurations.my-host.config.system.build.iso",
+      "output": "result/iso/nixos.iso (1.5-2GB)",
+      "contents": "Full desktop environment (GNOME/KDE), installer, documentation",
+      "desktop_options": "services.xserver.desktopManager.plasma5 or gnome"
+    },
+    "raw_disk_image": {
+      "purpose": "Pre-installed disk image for VMs or SD cards",
+      "command": "nix build .#nixosConfigurations.my-host.config.system.build.rawDiskImage",
+      "output": "result/disk-image.qcow2 or .raw (2-4GB)",
+      "format_options": [
+        "qcow2 - QEMU format with compression",
+        "vmdk - VMware format",
+        "raw - Raw disk image (dd-able to SD card)",
+        "ext4 - Just filesystem without partition table"
+      ],
+      "sd_card_workflow": "nix build .#disk-image && sudo dd if=result/sd-image.img of=/dev/sdX bs=4M status=progress"
+    },
+    "container_image": {
+      "docker": "pkgs.dockerTools.buildLayeredImage { contents = [ config.system.build.dockerImage ]; }",
+      "oci": "pkgs.dockerTools.buildImage { config = { ... }; } with ociMediaType = true",
+      "size_optimization": "Use pkgs.dockerTools.buildNixShellImage for minimal base (~50MB)",
+      "multi_arch": "pkgs.dockerTools.buildImageArchitectures for manifest lists"
+    },
+    "cloud_images": {
+      "aws_ami": "nix build .#nixosConfigurations.my-host.config.system.build.amazonImage",
+      "gcp_image": "nix build .#nixosConfigurations.my-host.config.system.build.googleComputeImage",
+      "azure_vhd": "nix build .#nixosConfigurations.my-host.config.system.build.azureImage",
+      "openstack": "nix build .#nixosConfigurations.my-host.config.system.build.openstackImage"
+    },
+    "netboot": {
+      "purpose": "PXE boot images for diskless workstations",
+      "components": [
+        "initrd - Minimal initramfs with network drivers",
+        "kernel - Configured for network boot",
+        "squashfs - Read-only root filesystem"
+      ],
+      "command": "nix build .#nixosConfigurations.my-host.config.system.build.netbootRamdisk"
+    }
+  },
+  "kernel_customization": {
+    "kernel_variants": {
+      "linux_latest": "Latest stable kernel (6.12 as of NixOS 25.11)",
+      "linux_lts": "Long-term support kernel (6.6 LTS)",
+      "linux_hardened": "Hardened kernel with grsecurity-inspired patches",
+      "linux_zen": "Zen kernel with desktop/gaming optimizations",
+      "linux_rt": "Real-time kernel (PREEMPT_RT patches)",
+      "linux_libre": "Deblobbed kernel (FSF-approved)",
+      "custom_kernel": "User-defined kernel config via config.kernelPatches"
+    },
+    "configuration_methods": {
+      "nixos_option": "boot.kernelPackages = pkgs.linuxPackages_latest;",
+      "custom_configfile": "boot.kernelPatches = [ { name = \"my-config\"; patch = null; extraConfig = \"\"; } ];",
+      "kernel_configfile": "boot.kernelConfigFile = ./my-kernel-config;",
+      "kernel_config": "boot.kernelConfig = \"\";\n  CONFIG_MY_DRIVER=y\n  CONFIG_DEBUG_INFO=n\n\"\";"
+    },
+    "module_handling": {
+      "built_in": "CONFIG_MY_DRIVER=y - compiled into kernel image",
+      "module": "CONFIG_MY_DRIVER=m - loadable module in /run/current-system/kernel-modules",
+      "external_module": "boot.extraModulePackages = [ pkgs.my-kernel-module ];",
+      "firmware": "hardware.firmware = [ pkgs.linux-firmware ];"
+    },
+    "initrd_customization": {
+      "purpose": "Early userspace for mounting root filesystem",
+      "contents": "Essential drivers, cryptsetup, network tools for netboot",
+      "customization": "boot.initrd.availableKernelModules = [ \"ahci\" \"xhci_pci\" ];",
+      "extra_utils": "boot.initrd.extraUtils = pkgs.makeInitrdUtils { extraPackages = [ pkgs.cryptsetup ]; };",
+      "secrets": "boot.initrd.secrets = { \"/crypto_keyfile.bin\" = \"/persist/crypto_keyfile.bin\"; };"
+    },
+    "secure_boot": {
+      "status": "Experimental in NixOS 25.11",
+      "components": [
+        "shim - Microsoft-signed bootloader",
+        "systemd-boot signed with user key",
+        "Kernel signed with user key",
+        "initrd signed with user key"
+      ],
+      "workflow": "boot.loader.systemd-boot.enable = true; boot.loader.efi.canTouchEfiVariables = true; boot.loader.efi.efiSysMountPoint = \"/boot\";",
+      "key_management": "Requires manual key enrollment in UEFI firmware"
+    },
+    "kernel_parameters": {
+      "boot_kernel_params": "boot.kernelParams = [ \"quiet\" \"loglevel=4\" \"mitigations=off\" ];",
+      "per_module_params": "boot.kernelModules = [ \"kvm-intel\" ]; boot.kernelModuleOptions = { \"kvm-intel\" = \"nested=1\"; };",
+      "debugging": "boot.kernelParams = [ \"earlyprintk\" \"console=ttyS0,115200\" \"ignore_loglevel\" ];"
+    }
+  },
+  "arm_specific": {
+    "bootloaders": {
+      "u_boot": "boot.loader.uBoot.enable = true; boot.loader.uBoot.platform = \"raspberryPi4\";",
+      "raspberrypi": "hardware.raspberry-pi.\"4\".fkms-3d.enable = true;",
+      "allwinner": "boot.loader.uBoot.platform = \"allwinner\"; boot.loader.uBoot.board = \"pine64_plus\";",
+      "rockchip": "boot.loader.uBoot.platform = \"rockchip\"; boot.loader.uBoot.board = \"rockpro64\";"
+    },
+    "device_trees": {
+      "purpose": "Hardware description for ARM systems (replaces PCI enumeration)",
+      "location": "/run/current-system/kernel-modules/dtbs/",
+      "customization": "boot.kernelPatches = [ { name = \"custom-dtb\"; patch = ./my-device-tree.dts; } ];",
+      "overlay": "boot.kernelParams = [ \"fdt_overlay=${./my-overlay.dtbo}\" ];"
+    },
+    "firmware": {
+      "raspberrypi": "hardware.raspberry-pi.firmware.package = pkgs.raspberrypi-firmware;",
+      "allwinner": "hardware.enableRedistributableFirmware = true;",
+      "rockchip": "hardware.firmware = [ pkgs.rockchip-firmware ];"
+    }
+  },
+  "riscv_specific": {
+    "status": "Tier 2 support in NixOS 25.11 (community maintained)",
+    "bootloaders": {
+      "opensbi": "boot.loader.generic-extlinux-compatible.enable = true;",
+      "u_boot": "boot.loader.uBoot.enable = true; boot.loader.uBoot.platform = \"riscv64\";"
+    },
+    "hardware_support": [
+      "SiFive Unmatched (FU740)",
+      "StarFive VisionFive 2",
+      "Allwinner NeZha (D1)",
+      "QEMU virt machine"
+    ],
+    "limitations": [
+      "No binary cache - all packages must be built from source",
+      "Limited hardware support (primarily development boards)",
+      "No GPU acceleration support",
+      "Some packages fail to build due to RISC-V specific issues"
+    ],
+    "qemu_workflow": {
+      "command": "nix build .#nixosConfigurations.riscv64.config.system.build.qemuDiskImage",
+      "run": "qemu-system-riscv64 -machine virt -cpu rv64 -m 2G -nographic -kernel ./result/kernel -initrd ./result/initrd -drive file=./result/disk-image.qcow2,format=qcow2"
+    }
+  },
+  "multi_arch_flakes": {
+    "pattern": {
+      "structure": "outputs = { self, nixpkgs }: {\n  packages = {\n    x86_64-linux = { default = ...; };\n    aarch64-linux = { default = ...; };\n    riscv64-linux = { default = ...; };\n  };\n};",
+      "system_detection": "let systems = [ \"x86_64-linux\" \"aarch64-linux\" \"riscv64-linux\" ];\n    forAllSystems = f: builtins.genAttrs systems (system: f nixpkgs.legacyPackages.${system});",
+      "conditional_logic": "if stdenv.hostPlatform.isAarch64 then ... else ..."
+    },
+    "hydra_evaluation": {
+      "purpose": "Pre-evaluate flake for all systems to catch cross-compilation errors early",
+      "command": "nix flake show --all-systems",
+      "ci_integration": "nix flake check --all-systems in CI pipeline"
+    }
+  },
+  "hardware_database": {
+    "nixos_hardware": {
+      "repository": "github:NixOS/nixos-hardware",
+      "purpose": "Pre-configured modules for specific hardware",
+      "examples": [
+        "nixos-hardware.nixosModules.framework-13th-gen-intel",
+        "nixos-hardware.nixosModules.lenovo-thinkpad-x1-carbon-10th-gen",
+        "nixos-hardware.nixosModules.raspberry-pi.4",
+        "nixos-hardware.nixosModules.sifive-unmatched"
+      ],
+      "usage": "imports = [ nixos-hardware.nixosModules.raspberry-pi.4 ];",
+      "benefits": "Optimal kernel parameters, firmware, driver configuration for specific devices"
+    },
+    "community_hardware": {
+      "mobile_nixos": "github:NixOS/mobile-nixos - NixOS for smartphones/tablets",
+      "nixos_automotive": "github:NixOS/automotive - Automotive-grade NixOS configurations",
+      "nixos_embedded": "github:NixOS/embedded - Embedded/IoT focused configurations"
+    }
+  }
+}
