@@ -1,0 +1,143 @@
+CORE COMMANDS (Nix 2.26)
+
+nix build .#package
+  Build derivation → /result symlink to /nix/store path
+  Executes build phase in sandbox
+  Typical use: CI/CD artifact production
+
+nix shell nixpkgs#package
+  Imperative shell with runtime dependencies in $PATH
+  Does NOT execute build phase
+  Typical use: nix shell nixpkgs#ripgrep -c rg --version
+
+nix develop
+  Reproducible development environment with BUILD dependencies
+  Executes shellHook from devShell
+  Typical use: nix develop enters environment with compilers/toolchain
+  Replaces deprecated nix-shell
+
+nix run nixpkgs#package
+  Execute package's meta.mainProgram directly
+  No shell entry - runs binary and exits
+  Typical use: nix run nixpkgs#hello
+
+nix eval .#attrpath
+  Evaluate Nix expression WITHOUT building
+  UNSANDBOXED - security boundary
+  Typical use: nix eval .#packages.x86_64-linux.hello.meta.description
+
+nix flake show
+  Inspect flake outputs structure
+  UNSANDBOXED evaluation - dangerous for untrusted flakes
+  Best practice: pin inputs first via nix flake lock
+
+nix flake check --all-systems
+  Verify flake builds successfully across all declared systems
+  Required pre-merge check for multi-platform flakes
+
+nix profile install nixpkgs#package
+  Imperative user profile management (Nix 2.4+)
+  Replaces nix-env -iA
+  Profile location: ~/.local/state/nix/profiles/default
+
+nix profile remove nixpkgs#package
+  Remove package from user profile
+  Does NOT delete from /nix/store (garbage collection required)
+
+nix-store -q --references /nix/store/...
+  Show direct dependencies of store path
+  Critical for understanding closure size
+
+nix-store -q --referrers /nix/store/...
+  Show paths that reference given store path
+  Critical for GC debugging - why path cannot be collected
+
+nix-store -q --deriver /nix/store/...
+  Show .drv file that produced given store path
+  Rebuild workflow: nix-store -r $(nix-store -q --deriver /path)
+
+nix-store --verify --all
+  Cryptographic verification of ALL store paths
+  Detects store corruption or tampering
+  Added in Nix 2.26
+
+nix-collect-garbage
+  Delete unreferenced store paths
+  Safe - preserves all GC roots
+
+nix-collect-garbage -d
+  DANGEROUS: deletes ALL old generations (irreversible)
+  No rollback possible after execution
+
+nix-env --delete-generations +3
+  Delete all but last 3 generations
+  Safer alternative to -d flag
+
+nix-store --optimise
+  Deduplicate identical files via hard links
+  Typical savings: 15-30% disk space reduction
+  Safe to run anytime - only creates hard links
+
+nixos-rebuild switch --flake .#hostname
+  Build and activate new NixOS configuration
+  Creates new GC root for system generation
+  Atomic upgrade with rollback capability
+
+nixos-rebuild test
+  Activate configuration WITHOUT making it bootable
+  Safe for testing - reverts on reboot
+
+nixos-rebuild switch --rollback
+  Revert to previous system generation
+  Executes previous generation's activation script
+
+nix flake update
+  Update flake inputs to latest versions
+  Updates flake.lock file
+  Best practice: review changes before committing
+
+nix flake lock --update-input nixpkgs
+  Targeted update of single input
+  Safer than full flake update for production systems
+
+nix search nixpkgs hello
+  Search package descriptions
+  Shows license, version, description
+
+nix why-depends /nix/store/path1 /nix/store/path2
+  Show dependency path between two store paths
+  Critical for understanding closure relationships
+
+nix store diff-closures path1 path2
+  Compare two store paths byte-for-byte
+  0 bytes difference → bit-for-bit reproducible
+
+nix doctor
+  Audit Nix installation security configuration
+  Added in Nix 2.26
+  Checks sandboxing, trusted users, substituters
+
+DEBUGGING COMMANDS
+
+nix build --dry-run .#package
+  Show derivation hash and dependencies without building
+
+nix build --keep-failed .#package
+  Preserve build directory after failure for inspection
+
+nix-store -l $(nix-instantiate default.nix)
+  Show build log for derivation
+
+nix repl
+  Interactive Nix evaluator
+  :l <nixpkgs> loads package set
+  :t expr shows type of expression
+
+nix show-config | grep sandbox
+  Verify sandboxing is enabled (should be true)
+
+journalctl -u nix-daemon | grep 'import-from-derivation'
+  Monitor daemon for IFD attempts (security boundary violation)
+
+sudo socat -v UNIX-LISTEN:/tmp/debug.sock,fork UNIX-CONNECT:/run/nix-daemon/socket
+  Debug Nix daemon RPC traffic (advanced)
