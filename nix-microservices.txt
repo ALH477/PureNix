@@ -1,0 +1,208 @@
+MICROSERVICE PATTERNS WITH NIX
+
+Pattern 1: Stateless systemd Service (Production Ready)
+
+# flake.nix structure
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  outputs = { self, nixpkgs }: {
+    nixosConfigurations.production-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        {
+          services.my-service = {
+            enable = true;
+            port = 8080;
+            package = self.packages.x86_64-linux.my-service;
+          };
+        }
+      ];
+    };
+    packages.x86_64-linux.my-service = nixpkgs.legacyPackages.x86_64-linux.callPackage ./my-service.nix {};
+  };
+}
+
+# NixOS module (services.my-service)
+{ config, pkgs, lib, ... }:
+with lib;
+let cfg = config.services.my-service;
+in {
+  options.services.my-service = {
+    enable = mkEnableOption "my microservice";
+    port = mkOption { type = types.port; default = 8080; };
+    package = mkOption { type = types.package; };
+  };
+
+  config = mkIf cfg.enable {
+    systemd.services.my-service = {
+      description = "My Microservice";
+      after = [ "network.target" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/my-service --port=${toString cfg.port}";
+        Restart = "on-failure";
+        RestartSec = 5;
+        DynamicUser = true;                # Unprivileged ephemeral user
+        StateDirectory = "my-service";     # /var/lib/my-service
+        LogsDirectory = "my-service";      # /var/log/my-service
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ReadWritePaths = "/var/lib/my-service";
+        Environment = [ "LOG_LEVEL=info" "PORT=${toString cfg.port}" ];
+      };
+    };
+  };
+}
+
+Deployment workflow:
+  sudo nixos-rebuild switch --flake .#production-host
+  systemctl status my-service
+  journalctl -u my-service -f
+
+Rollback:
+  sudo nixos-rebuild switch --rollback  # Atomic rollback to previous generation
+
+Pattern 2: Distroless Docker Image (Minimal Attack Surface)
+
+# default.nix
+{ pkgs, lib }:
+let
+  myApp = pkgs.callPackage ./my-app.nix {};
+in pkgs.dockerTools.buildLayeredImage {
+  name = "registry.example.com/my-service";
+  tag = "1.0.0";
+
+  # Minimal contents - only binary + required libs
+  contents = [
+    myApp
+    pkgs.glibc  # Required for dynamic linking
+  ];
+
+  config = {
+    Cmd = [ "${myApp}/bin/my-service" "--port=8080" ];
+    ExposedPorts = { "8080/tcp" = { }; };
+    Env = [ "PORT=8080" "LOG_LEVEL=info" ];
+  };
+
+  # Maximize reproducibility
+  created = "1970-01-01T00:00:01Z";  # Fixed timestamp
+  maxLayers = 1;  # Single layer for minimal size
+}
+
+Build and deploy:
+  nix-build -E 'with import <nixpkgs> {}; callPackage ./default.nix {}'
+  docker load < result
+  docker push registry.example.com/my-service:1.0.0
+
+Security properties:
+  - No shell (distroless) - debugging requires external tools
+  - Minimal closure size (~10-20MB for Go services)
+  - Bit-for-bit reproducible with fixed timestamp
+  - OCI-compliant (NixOS 25.11+)
+
+Pattern 3: NixOS Container (No Docker Daemon Required)
+
+# configuration.nix
+{ config, pkgs, ... }:
+{
+  virtualisation.containers.my-service = {
+    autoStart = true;
+    privateNetwork = true;
+    hostAddress = "10.0.0.1";
+    localAddress = "10.0.0.2";
+    bindMounts."/data" = {
+      source = "/var/lib/host-data";
+      isReadOnly = false;
+    };
+    config = { config, pkgs, ... }: {
+      systemd.services.my-service = {
+        enable = true;
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig.ExecStart = "${pkgs.my-service}/bin/my-service --port=8080";
+      };
+      networking.firewall.allowedTCPPorts = [ 8080 ];
+    };
+  };
+}
+
+Management:
+  nixos-container create my-service --config-file container.nix
+  nixos-container start my-service
+  nixos-container root-login my-service  # Root shell in container
+  nixos-container run my-service -- systemctl status my-service
+
+Advantages over Docker:
+  - No daemon required (systemd-nspawn based)
+  - Full NixOS configuration inside container
+  - Seamless integration with host Nix store (deduplication)
+  - No image layer complexity
+
+Limitations:
+  - Linux-only (no macOS/Windows support)
+  - Less mature tooling than Docker ecosystem
+
+Pattern 4: Multi-Service Deployment with Flakes
+
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  outputs = { self, nixpkgs }: 
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      forEachSystem = f: builtins.listToAttrs (map (s: { name = s; value = f nixpkgs.legacyPackages.${s}; }) systems);
+    in {
+      packages = forEachSystem (pkgs: {
+        api-server = pkgs.callPackage ./api-server.nix {};
+        auth-service = pkgs.callPackage ./auth-service.nix {};
+        db-migrator = pkgs.callPackage ./db-migrator.nix {};
+      });
+      
+      nixosConfigurations.production = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          ./production.nix
+          {
+            services.api-server.enable = true;
+            services.auth-service.enable = true;
+            systemd.services.db-migrator = {
+              enable = true;
+              after = [ "postgresql.service" ];
+              wantedBy = [ "multi-user.target" ];
+              serviceConfig.Type = "oneshot";
+              serviceConfig.RemainAfterExit = true;
+              script = "${self.packages.x86_64-linux.db-migrator}/bin/migrate";
+            };
+          }
+        ];
+      };
+    };
+}
+
+Deployment strategy:
+  - All services built from single flake.lock (reproducible)
+  - Atomic system activation via nixos-rebuild switch
+  - Per-service rollback via systemd (not full system rollback)
+  - Health checks via systemd service dependencies
+
+Pattern 5: Secrets Management (Production Pattern)
+
+ANTI-PATTERN: DO NOT embed secrets in derivations
+  bad = stdenv.mkDerivation {
+    environmentFile = pkgs.writeText "env" "DB_PASSWORD=${builtins.getEnv "DB_PASSWORD"}";
+    # Secret embedded in .drv file → visible to all users!
+  }
+
+PRODUCTION PATTERN: Runtime secret injection
+  systemd.services.my-service = {
+    serviceConfig.EnvironmentFile = "/run/secrets/my-service.env";
+    # File populated by external secrets manager (Vault, sops-nix)
+  };
+
+Recommended tools:
+  - sops-nix: Age/GPG-encrypted secrets in Git
+  - agenix: Age-based secret management
+  - Vault integration via systemd service pre-start hooks
+
+Critical rule: Secrets NEVER in /nix/store - always runtime-injected via tmpfs or protected directories
