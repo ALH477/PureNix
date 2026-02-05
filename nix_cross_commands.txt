@@ -1,0 +1,185 @@
+CROSS-COMPILATION COMMANDS (Nix 2.26)
+
+Basic cross-build:
+  nix build .#packages.aarch64-linux.my-package
+  file ./result/bin/my-app  # Verify architecture: ELF 64-bit LSB executable, ARM aarch64
+
+Cross-toolchain inspection:
+  nix-shell -p pkgsCross.aarch64-multiplatform.stdenv.cc --run "aarch64-unknown-linux-gnu-gcc --version"
+  nix eval nixpkgs#pkgsCross.aarch64-multiplatform.stdenv.cc.targetPlatform.config
+    # Returns: "aarch64-unknown-linux-gnu"
+
+QEMU user-mode testing:
+  nix-shell -p qemu pkgsCross.aarch64-multiplatform.stdenv.cc --run \
+    "qemu-aarch64 -L ${pkgsCross.aarch64-multiplatform.stdenv.cc.libc} ./result/bin/my-app"
+
+RISC-V cross-build:
+  nix build .#packages.riscv64-linux.my-package
+  nix-shell -p qemu --run "qemu-riscv64 -L ${pkgs.pkgsCross.riscv64-multiplatform.stdenv.cc.libc} ./result/bin/my-app"
+
+Musl static binary (ARM64):
+  nix-build -E 'with import <nixpkgs> {}; pkgs.pkgsMusl.aarch64.hello'
+  ldd ./result/bin/hello  # "not a dynamic executable"
+  file ./result/bin/hello # ELF 64-bit LSB executable, ARM aarch64, statically linked
+
+Cross-compilation debugging:
+  # Inspect cross-gcc flags
+  nix-shell -p pkgsCross.aarch64-multiplatform.stdenv.cc --run \
+    "aarch64-unknown-linux-gnu-gcc -v 2>&1 | grep -A 10 'Configured with'"
+  
+  # Check target libc
+  ls $(nix-build -E 'with import <nixpkgs> {}; pkgs.pkgsCross.aarch64-multiplatform.glibc')/lib
+
+Multi-architecture flake evaluation:
+  nix flake show --all-systems
+  nix flake check --all-systems  # Build for all declared systems
+
+NIXOS IMAGE BUILDING COMMANDS
+
+Minimal installer ISO:
+  nix build .#nixosConfigurations.my-host.config.system.build.isoMinimal
+  ls ./result/iso/*.iso
+
+Graphical installer ISO:
+  nix build .#nixosConfigurations.my-host.config.system.build.iso
+  # Customize desktop:
+  #   services.xserver.desktopManager.plasma5.enable = true;
+  #   services.xserver.displayManager.sddm.enable = true;
+
+Raw disk image (QCOW2):
+  nix build .#nixosConfigurations.my-host.config.system.build.qcow2Image
+  qemu-system-x86_64 -drive file=./result/disk-image.qcow2,format=qcow2
+
+Raw disk image (raw format for SD cards):
+  nix build .#nixosConfigurations.my-host.config.system.build.rawDiskImage
+  sudo dd if=./result/sd-image.img of=/dev/sdX bs=4M status=progress
+
+ARM64 disk image (Raspberry Pi 4):
+  nix build .#nixosConfigurations.rpi4.config.system.build.sdImage
+  # Requires configuration with:
+  #   boot.loader.raspberryPi.enable = true;
+  #   boot.loader.raspberryPi.version = 4;
+  sudo dd if=./result/sd-image.img of=/dev/sdX bs=4M status=progress
+
+RISC-V disk image (QEMU virt):
+  nix build .#nixosConfigurations.riscv64.config.system.build.qemuDiskImage
+  qemu-system-riscv64 -machine virt -cpu rv64 -m 2G -nographic \
+    -kernel ./result/kernel -initrd ./result/initrd \
+    -drive file=./result/disk-image.qcow2,format=qcow2
+
+Docker image:
+  nix build .#nixosConfigurations.my-host.config.system.build.dockerImage
+  docker load < ./result
+  docker run -it my-nixos-image
+
+Multi-architecture Docker image:
+  nix build .#dockerImageMultiArch
+  # Requires configuration with:
+  #   system.build.dockerImageMultiArch = pkgs.dockerTools.buildImageArchitectures {
+  #     architectures = [ "x86_64-linux" "aarch64-linux" ];
+  #     ...
+  #   };
+
+Cloud images:
+  # AWS AMI
+  nix build .#nixosConfigurations.aws.config.system.build.amazonImage
+  # Upload to S3 then import as AMI via AWS CLI
+  
+  # GCP image
+  nix build .#nixosConfigurations.gcp.config.system.build.googleComputeImage
+  # Upload to GCS then import via gcloud compute images import
+
+Netboot images:
+  nix build .#nixosConfigurations.netboot.config.system.build.netbootRamdisk
+  # Outputs initrd and kernel for PXE boot
+
+KERNEL CUSTOMIZATION COMMANDS
+
+List available kernels:
+  nix-shell -p nixpkgs.linuxPackages_latest --run "modinfo -k $(nix-shell -p linuxPackages_latest --run 'ls /run/current-system/kernel') | head"
+  nix eval nixpkgs#linuxPackages_latest.version  # 6.12.13 as of Feb 2026
+
+Build custom kernel:
+  nix-build -E 'with import <nixpkgs> {}; linuxPackagesFor (linux_latest.override {
+    structuredExtraConfig = with lib.kernel; {
+      MY_DRIVER = yes;
+      DEBUG_INFO = no;
+    };
+  }).kernel'
+
+Extract kernel config:
+  zcat /proc/config.gz > current-config
+  nix-shell -p linuxPackages_latest --run "zcat /run/booted-system/kernel-modules/lib/modules/*/config > nixos-config"
+
+Build initrd with extra tools:
+  nix-build -E 'with import <nixpkgs> {}; (config.boot.initrd.extraUtils.override {
+    extraPackages = pkgs: [ pkgs.cryptsetup pkgs.btrfs-progs ];
+  })'
+
+Kernel module signing (for Secure Boot):
+  nix-shell -p sbctl --run "sbctl create-keys"
+  nix-shell -p sbctl --run "sbctl sign -s /run/booted-system/kernel"
+  nix-shell -p sbctl --run "sbctl sign -s /run/booted-system/initrd"
+
+ARM-SPECIFIC COMMANDS
+
+Raspberry Pi 4 image build:
+  nix build .#nixosConfigurations.rpi4.config.system.build.sdImage
+  # Configuration requires:
+  #   boot.loader.raspberryPi.enable = true;
+  #   boot.loader.raspberryPi.version = 4;
+  #   hardware.raspberry-pi."4".fkms-3d.enable = true;
+
+U-Boot configuration:
+  nix-shell -p u-boot-tools --run "mkimage -l u-boot.bin"  # Inspect U-Boot image
+  nix eval nixpkgs#u-boot_raspberry_pi_4.config.deviceTree  # View device tree
+
+Device tree overlay compilation:
+  nix-shell -p dtc --run "dtc -I dts -O dtb -o my-overlay.dtbo my-overlay.dts"
+
+RISC-V-SPECIFIC COMMANDS
+
+RISC-V QEMU boot:
+  nix build .#nixosConfigurations.riscv64.config.system.build.qemuDiskImage
+  qemu-system-riscv64 -machine virt -cpu rv64 -m 2G -nographic \
+    -bios default -kernel ./result/kernel -initrd ./result/initrd \
+    -drive file=./result/disk-image.qcow2,format=qcow2 \
+    -append "console=ttyS0"
+
+OpenSBI firmware:
+  nix-shell -p opensbi --run "ls ${opensbi}/firmware/"
+  # Generic firmware: generic/fw_payload.elf
+  # Platform-specific: qemu/virt/fw_payload.elf
+
+Cross-compilation status check:
+  nix eval nixpkgs#pkgsCross.riscv64-multiplatform.stdenv.hostPlatform.system
+    # Returns: "x86_64-linux"
+  nix eval nixpkgs#pkgsCross.riscv64-multiplatform.stdenv.targetPlatform.system
+    # Returns: "riscv64-linux"
+
+DEBUGGING COMMANDS
+
+Inspect cross-toolchain:
+  nix-shell -p pkgsCross.aarch64-multiplatform.stdenv.cc --run \
+    "aarch64-unknown-linux-gnu-gcc -print-sysroot"
+    # Returns: /nix/store/...-aarch64-unknown-linux-gnu-stage-final
+
+Check binary architecture:
+  file ./result/bin/my-app
+  readelf -h ./result/bin/my-app | grep Machine
+
+Inspect initrd contents:
+  mkdir /tmp/initrd && cd /tmp/initrd
+  zcat /run/current-system/initrd | cpio -idmv
+
+Kernel module dependencies:
+  nix-shell -p kmod --run "modprobe --show-depends zfs"
+  nix-shell -p kmod --run "lsmod | grep zfs"
+
+Boot parameter inspection:
+  cat /proc/cmdline
+  dmesg | grep -i "command line"
+
+Cross-build failure debugging:
+  nix build .#packages.aarch64-linux.my-package --keep-failed
+  cat /tmp/nix-build-my-package.drv-*/build.log | grep -A 20 "error:"
