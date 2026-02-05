@@ -1,0 +1,446 @@
+{
+  "metadata": {
+    "version_context": "Nix 2.26.4 | NixOS 25.11 'Xantusia' | February 2026",
+    "reproducibility_rate": "91% of nixpkgs builds are bit-for-bit reproducible",
+    "flake_status": "Experimental (RFC 0065 not finalized) despite widespread adoption",
+    "support_timeline": "NixOS 25.11 receives security updates until June 30, 2026"
+  },
+  "core_concepts": [
+    {
+      "concept": "Purely functional package management",
+      "definition": "Packages built from pure functions where identical inputs produce identical /nix/store paths",
+      "store_path_format": "/nix/store/<base32-hash(derivation)>-name-version",
+      "hash_algorithm": "SHA-256 truncated to 160 bits → base32 encoding (32 characters)",
+      "critical_property": "Changing ANY input (including whitespace in builder scripts) changes store path"
+    },
+    {
+      "concept": "Input-addressed derivations (default)",
+      "definition": "Store path hash computed over derivation inputs (ATerm serialization)",
+      "inputs_included": [
+        "builder path (/nix/store/...-bash/bin/bash)",
+        "args array",
+        "env variables (src, buildInputs, configureFlags)",
+        "ALL transitive dependency store paths (recursive hashing)"
+      ],
+      "security_property": "Input integrity required; compromised compiler produces different outputs with same hash"
+    },
+    {
+      "concept": "Fixed-output derivations (FODs)",
+      "definition": "Store path hash computed over ACTUAL OUTPUT CONTENT (not derivation inputs)",
+      "primary_use": "fetchurl, fetchgit, fetchFromGitHub",
+      "security_property": "Output verified before substitution; immune to compromised build tools",
+      "limitation": "Only works for pure content fetches; cannot include build steps"
+    },
+    {
+      "concept": "Content-addressed derivations (CADs)",
+      "definition": "Store path hash computed over output content + derivation inputs",
+      "status": "Experimental (Nix 2.4+)",
+      "requirement": "Bit-for-bit reproducible builds required",
+      "limitation": "Fails for 9% of nixpkgs (non-reproducible packages like chromium, rustc)",
+      "flag": "__contentAddressed = true"
+    },
+    {
+      "concept": "Evaluation vs build separation",
+      "evaluation_phase": {
+        "description": "Nix language expressions parsed into derivation objects (ATerms)",
+        "environment": "Unsandboxed on host machine",
+        "security_boundary": "Critical vulnerability surface - malicious flakes execute arbitrary code during nix flake show",
+        "debug_command": "nix eval .#package"
+      },
+      "build_phase": {
+        "description": "Derivations executed in isolated sandbox",
+        "environment": "Linux namespaces (mount, network, PID, user, time frozen to epoch 1)",
+        "security_boundary": "Strong isolation on Linux; weak on macOS (no user namespaces)",
+        "debug_command": "nix build .#package --keep-failed"
+      }
+    },
+    {
+      "concept": "Garbage collection model",
+      "root_types": [
+        "Profile generations (/nix/var/nix/profiles/default-*-link)",
+        "System generations (/nix/var/nix/profiles/system-*-link)",
+        "Indirect roots (/nix/var/nix/gcroots/auto/* → symlink → target)",
+        "Temporary roots (/run/nix/gcroots/* - tmpfs, lost on reboot)",
+        "User profiles (~/.local/state/nix/profiles/)"
+      ],
+      "reference_tracking": "ELF DT_NEEDED + RPATH scanning, script shebangs, archive recursion",
+      "critical_command": "nix-store -q --referrers-closure /nix/store/... shows WHY path is alive",
+      "dangerous_command": "nix-collect-garbage -d deletes ALL old generations (irreversible)"
+    }
+  ],
+  "language_syntax": [
+    {
+      "construct": "Attrsets",
+      "basic_syntax": "{ name = \"value\"; nested = { x = 1; }; }",
+      "recursive_syntax": "rec { a = 1; b = a + 1; }",
+      "inheritance": "base // { z = 3; }",
+      "anti_pattern": "with pkgs; [...] - breaks reproducibility, causes name collisions, rejected by nixpkgs maintainers",
+      "evaluation_semantics": "LAZY - values computed only when accessed; order irrelevant",
+      "lookup_complexity": "O(log n) via sorted vector (not hash map)"
+    },
+    {
+      "construct": "Lists",
+      "basic_syntax": "[ 1 2 3 ] - NO commas between elements",
+      "heterogeneous": "true - [ pkgs.python3 \"string\" 42 ] valid",
+      "concatenation": "++ operator creates NEW list (O(n) operation)",
+      "quadratic_pitfall": "Repeated concatenation in loop: bad = n: if n==0 then [] else bad(n-1)++[n] → O(n²)",
+      "lazy_evaluation": "Elements evaluated ONLY when accessed via builtins.elemAt",
+      "infinite_lists": "Possible via recursion: let ones = 1 : ones; in builtins.elemAt ones 1000000"
+    },
+    {
+      "construct": "Strings",
+      "double_quoted": "\"value: ${x}\" - standard escaping (\\n, \\t), interpolation via ${}",
+      "indented": "''multi-line'' - NO escaping, ''${ for literal ${, strips common leading indent",
+      "path_coercion": "\"${./.}\" → \"/home/user/project\" - ONLY works inside ${...}",
+      "critical_footgun": "String concatenation loses path properties: \"/nix/store/\" + hash → plain string (NO reference tracking)",
+      "safe_pattern": "\"${pkgs.bash}/bin/bash\" preserves store path reference"
+    },
+    {
+      "construct": "Functions",
+      "fundamental_form": "Single-parameter lambda: arg: body",
+      "attrset_pattern": "{ a, b ? 10, ... }: a + b - multi-param via destructuring",
+      "default_args": "Evaluated LAZILY - only computed if accessed",
+      "variadic": "{ a, b, ... }: ... ignores extra attributes",
+      "at_pattern": "args@{ a, b }: { sum = a+b; original = args } binds entire attrset"
+    },
+    {
+      "construct": "let/in scoping",
+      "syntax": "let a = 1; b = a + 1; in b * 2",
+      "shadowing": "Inner bindings shadow outer bindings lexically",
+      "recursion": "Direct and mutual recursion allowed; limited by ~10,000 frame stack depth",
+      "forward_reference": "Illegal in attrsets without rec: { a = b + 1; b = 2; } → error",
+      "lazy_evaluation": "Bindings evaluated ONLY when accessed"
+    },
+    {
+      "construct": "String context (hidden dependencies)",
+      "mechanism": "Path interpolation adds context: s = \"${pkgs.bash}/bin\" carries reference to pkgs.bash",
+      "propagation": "Context preserved through string operations: s2 = s + \" --version\" still has context",
+      "stripping": "builtins.toString s removes context → plain string",
+      "security_risk": "Context leakage into derivation names exposes secrets: pname = \"app-${secret}\" → store path contains secret",
+      "mitigation": "builtins.stripContext (Nix 2.26+) or builtins.toString before interpolation"
+    }
+  ],
+  "commands": [
+    {
+      "command": "nix build .#package",
+      "purpose": "Build derivation → /result symlink to /nix/store path",
+      "build_phase": true,
+      "typical_use": "CI/CD artifact production, Docker image builds"
+    },
+    {
+      "command": "nix shell nixpkgs#package",
+      "purpose": "Imperative shell with runtime dependencies in $PATH",
+      "build_phase": false,
+      "typical_use": "Quick CLI tool access: nix shell nixpkgs#ripgrep -c rg --version"
+    },
+    {
+      "command": "nix develop",
+      "purpose": "Reproducible dev environment with BUILD dependencies (compilers, headers)",
+      "build_phase": false,
+      "typical_use": "Development shells with shellHook execution",
+      "legacy_replacement": "Replaces nix-shell (deprecated)"
+    },
+    {
+      "command": "nix run nixpkgs#package",
+      "purpose": "Execute package's meta.mainProgram directly",
+      "build_phase": false,
+      "typical_use": "One-off script execution without entering shell"
+    },
+    {
+      "command": "nix flake show",
+      "purpose": "Inspect flake outputs without building",
+      "security_warning": "Evaluation happens UNSANDBOXED - malicious flakes can execute code",
+      "best_practice": "Only run on trusted flakes; pin inputs first via nix flake lock"
+    },
+    {
+      "command": "nix store verify --all",
+      "purpose": "Cryptographic verification of ALL store paths against known hashes",
+      "security_use": "Detect store corruption or tampering",
+      "added_in": "Nix 2.26"
+    },
+    {
+      "command": "nix-store -q --referrers /nix/store/...",
+      "purpose": "Show paths that reference given store path",
+      "gc_debugging": "Critical for understanding why path cannot be garbage collected"
+    },
+    {
+      "command": "nix-store -q --deriver /nix/store/...",
+      "purpose": "Show .drv file that produced given store path",
+      "rebuild_workflow": "nix-store -r $(nix-store -q --deriver /nix/store/...) rebuilds derivation"
+    },
+    {
+      "command": "nix flake check --all-systems",
+      "purpose": "Verify flake builds successfully across all declared systems",
+      "ci_use": "Required pre-merge check for multi-platform flakes"
+    },
+    {
+      "command": "nix profile install nixpkgs#package",
+      "purpose": "Imperative user profile management (replaces nix-env -iA)",
+      "added_in": "Nix 2.4",
+      "profile_location": "~/.local/state/nix/profiles/default"
+    }
+  ],
+  "microservice_patterns": [
+    {
+      "pattern": "Stateless microservice with systemd",
+      "flake_structure": {
+        "inputs": {
+          "nixpkgs": "github:NixOS/nixpkgs/nixos-25.11",
+          "flake-utils": "github:numtide/flake-utils"
+        },
+        "outputs": "Each system → packages.default (binary) + nixosConfigurations.<host> (deployment)"
+      },
+      "service_definition": {
+        "type": "systemd.services.<name>",
+        "critical_settings": [
+          "DynamicUser = true (unprivileged ephemeral user)",
+          "StateDirectory = \"service-name\" (/var/lib/service-name)",
+          "LogsDirectory = \"service-name\" (/var/log/service-name)",
+          "Restart = \"on-failure\"",
+          "Environment = [ \"PORT=8080\" \"LOG_LEVEL=info\" ]"
+        ],
+        "security_hardening": [
+          "NoNewPrivileges = true",
+          "PrivateTmp = true",
+          "ProtectSystem = \"strict\"",
+          "ReadWritePaths = \"/var/lib/service-name\""
+        ]
+      },
+      "deployment": "nixos-rebuild switch --flake .#<hostname> for atomic upgrades with rollback"
+    },
+    {
+      "pattern": "Multi-container microservice via NixOS containers",
+      "module": "virtualisation.containers.<name>",
+      "networking": "Containers share host network namespace by default; use systemd.nspawn.networking = false for isolation",
+      "storage": "bindMounts for persistent state: { source = \"/var/lib/host-data\"; target = \"/data\"; }",
+      "advantage": "No Docker daemon required; containers built from Nix derivations",
+      "limitation": "Linux-only; no macOS/Windows support"
+    },
+    "pattern": "Distroless Docker images via dockerTools",
+    "implementation": {
+      "base_image": "pkgs.dockerTools.mkImage { contents = [ ]; } - empty base",
+      "final_image": "pkgs.dockerTools.buildLayeredImage with contents = [ myApp pkgs.glibc ]",
+      "reproducibility": "created = \"1970-01-01T00:00:01Z\" fixes timestamp for bit-for-bit reproducibility",
+      "size_optimization": "maxLayers = 1 produces single-layer image",
+      "oci_compliance": "NixOS 25.11 dockerTools produces OCI-compliant images by default"
+    },
+    "deployment": "docker load < result or skopeo copy docker-archive:result docker://registry/image:tag"
+  ],
+  "security_boundaries": [
+    {
+      "boundary": "Evaluation security",
+      "threat_model": "Nix expressions evaluated directly on host machine with full filesystem/network access",
+      "attack_vector": "Malicious flake executes arbitrary code during nix flake show",
+      "mitigations": [
+        "Never evaluate untrusted flakes without auditing",
+        "Pin all inputs via nix flake lock before evaluation",
+        "Air-gapped environments: disable network during eval (--option http-connections 0)",
+        "Restrict allowed-users in multi-user setups"
+      ]
+    },
+    {
+      "boundary": "Build sandboxing (Linux)",
+      "isolation_mechanisms": [
+        "Mount namespaces: /nix/store read-only except output path",
+        "Network namespaces: loopback only (no external network)",
+        "PID namespaces: isolated process tree",
+        "User namespaces: builds as unprivileged nixbld user (UID 30000+)",
+        "Seccomp-BPF: blocks dangerous syscalls (reboot, kexec)",
+        "Time namespace: frozen to UNIX epoch 1"
+      ],
+      "limitations": [
+        "macOS: NO user namespaces → sandboxing fundamentally weaker (sandbox-exec only)",
+        "Windows/WSL2: sandboxing via Windows containers (less mature)",
+        "Kernel vulnerabilities can break namespace isolation (CVE history)"
+      ],
+      "verification": "nix show-config | grep sandbox → should be true"
+    },
+    {
+      "boundary": "Trusted user model",
+      "configuration": "/etc/nix/nix.conf trusted-users = root @wheel",
+      "trusted_users_privileges": [
+        "Disable sandboxing via --option sandbox false",
+        "Add paths directly to store (nix-store --add)",
+        "Use arbitrary substituters"
+      ],
+      "allowed_users_privileges": "Build packages but NOT bypass security controls",
+      "critical_rule": "trusted-users should NEVER include unprivileged users - equivalent to root access"
+    },
+    {
+      "boundary": "Binary cache trust",
+      "verification_flow": [
+        "1. Fetch .narinfo from cache",
+        "2. Verify Ed25519 signature against trusted-public-keys",
+        "3. Download NAR archive",
+        "4. Verify NarHash matches actual content"
+      ],
+      "attack_vector": "Cache poisoning - compromised cache serves malicious NAR with valid signature",
+      "mitigation": "Pin trusted-public-keys to exact fingerprints; never use wildcards",
+      "official_cache": "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+    }
+  ],
+  "cross_compilation": [
+    {
+      "concept": "pkgsCross architecture",
+      "host_system": "Where build runs (x86_64-linux)",
+      "target_system": "What we're building FOR (aarch64-linux)",
+      "toolchain_access": "pkgs.pkgsCross.aarch64-multiplatform.stdenv",
+      "libc_problem": "Target binaries link against TARGET libc; build tools run on HOST libc",
+      "solution": "pkgsCross.buildPackages provides host-compatible tools (cmake, python)",
+      "example": "nativeBuildInputs = pkgsCross.buildPackages.cmake; buildInputs = [ pkgsCross.glibc pkgsCross.zlib ]"
+    },
+    {
+      "concept": "FFI boundary challenges",
+      "rust_buildrs": "Compiles for HOST but generates code for TARGET → cargoBuildFlags = \"--target ${targetSystem}\"",
+      "python_cext": "Must compile against target Python + target libc → python.pkgsCross.${targetSystem}.buildPythonPackage",
+      "go_cgo": "Requires target C toolchain → CGO_ENABLED=1 CC=${pkgsCross.gcc}/bin/aarch64-unknown-linux-gnu-gcc",
+      "failure_rate": "FFI boundaries cause 80% of cross-compilation failures"
+    },
+    {
+      "concept": "Validation via QEMU",
+      "command": "qemu-aarch64 -L ${pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc.libc} ./result/bin/my-app",
+      "purpose": "Execute ARM64 binary on x86_64 host for testing",
+      "limitation": "Performance overhead; cannot test kernel interactions"
+    }
+  ],
+  "module_system": [
+    {
+      "concept": "Option merge priorities (highest to lowest)",
+      "priority_1": "mkForce - ignores all lower priorities (emergency override only)",
+      "priority_2": "mkOverride - overrides mkDefault/mkOption",
+      "priority_3": "Literal value - e.g., enable = true",
+      "priority_4": "mkDefault - only used if no higher priority value exists",
+      "priority_5": "mkOption - declaration only (no value)",
+      "determinism": "Import order DOES NOT matter - priority system ensures deterministic resolution"
+    },
+    {
+      "concept": "Type-specific merge strategies",
+      "listOf": "Concatenates lists (no de-duplication)",
+      "attrsOf": "Merges attrsets recursively (key-by-key)",
+      "simple_types": "Last definition wins (unless overridden by priority)",
+      "submodule": "Merges nested option definitions according to their types"
+    },
+    {
+      "concept": "Critical type constructors",
+      "listOf": "lib.types.listOf lib.types.str → [ \"a\" \"b\" ]",
+      "attrsOf": "lib.types.attrsOf lib.types.int → { a = 1; b = 2; }",
+      "nullOr": "lib.types.nullOr lib.types.str → null or string",
+      "enum": "lib.types.enum [ \"a\" \"b\" \"c\" ] → one of literal values",
+      "oneOf": "lib.types.oneOf [ lib.types.int lib.types.str ] → union type",
+      "submodule": "lib.types.submodule ({ config, ... }: { options.x = ... }) → nested configuration"
+    }
+  ],
+  "reproducibility_limits": [
+    {
+      "non_determinism_source": "Timestamps",
+      "manifestation": "Embedded in ELF binaries (build-id), ZIP archives",
+      "mitigation": "SOURCE_DATE_EPOCH=1 (Nix sets automatically)",
+      "residual_issues": "Some build systems ignore SOURCE_DATE_EPOCH"
+    },
+    {
+      "non_determinism_source": "ASLR (Address Space Layout Randomization)",
+      "manifestation": "Affects JIT compilers (V8, JVM) → non-deterministic code generation",
+      "mitigation": "Disable ASLR during build (setarch -R)",
+      "affected_packages": "nodejs, openjdk, electron"
+    },
+    {
+      "non_determinism_source": "Compiler parallelism",
+      "manifestation": "GCC parallel LTO, Rust incremental compilation",
+      "mitigation": "Disable parallelism (-j1), disable incremental compilation",
+      "affected_packages": "chromium, rustc, ghc"
+    },
+    {
+      "non_determinism_source": "Filesystem iteration order",
+      "manifestation": "find/glob without sorting → directory entry order varies by FS/kernel",
+      "mitigation": "Always sort (find . | sort)",
+      "common_in": "Makefiles without explicit ordering"
+    },
+    {
+      "verification_command": "nix store diff-closures /tmp/build1 /tmp/build2",
+      "interpretation": "0 bytes difference → bit-for-bit reproducible",
+      "current_rate": "91% of nixpkgs packages reproducible as of February 2026",
+      "non_reproducible": "chromium, electron, rustc, ghc (complex build systems, JIT compilers)"
+    }
+  ],
+  "platform_specific": [
+    {
+      "platform": "macOS",
+      "sandboxing_limitation": "No user namespaces → sandboxing fundamentally weaker (sandbox-exec only)",
+      "filesystem_issue": "Default APFS case-insensitive → breaks packages assuming case-sensitive FS",
+      "mitigation": "Create case-sensitive APFS volume for /nix",
+      "notarization": "GUI apps require Apple notarization; Gatekeeper blocks unsigned Nix store paths",
+      "sip_impact": "System Integrity Protection prevents modifying /usr/bin → requires PATH manipulation"
+    },
+    {
+      "platform": "Windows/WSL2",
+      "filesystem_performance": "/mnt/c extremely slow for I/O-heavy builds → MUST store Nix store in WSL2 ext4 (/home/user/.local/share/nix)",
+      "case_sensitivity": "NTFS case-preserving but case-insensitive → breaks Linux packages",
+      "mitigation": "fsutil file SetCaseSensitiveInfo on per-directory basis",
+      "symlink_limitation": "Requires Windows Developer Mode for symlinks",
+      "daemon_support": "No multi-user daemon support → single-user mode only"
+    },
+    {
+      "platform": "ARM64 macOS (Apple Silicon)",
+      "rosetta_overhead": "x86_64 builds require Rosetta 2 → 2-3x slowdown",
+      "native_builds": "aarch64-darwin packages build at native speed",
+      "cross_compilation": "x86_64-linux → aarch64-linux works well; macOS cross-compilation limited"
+    }
+  ],
+  "nixos_specific": [
+    {
+      "concept": "system.stateVersion",
+      "purpose": "Prevents automatic migration of stateful data between NixOS versions",
+      "critical_rule": "MUST match nixpkgs channel version (e.g., \"25.11\" for nixos-25.11)",
+      "breakage_scenario": "Upgrading nixpkgs without updating stateVersion → database format mismatches",
+      "location": "configuration.nix → system.stateVersion = \"25.11\""
+    },
+    {
+      "concept": "Hardware profiles (nixos-hardware)",
+      "repository": "github:NixOS/nixos-hardware",
+      "purpose": "Pre-configured modules for specific hardware (Framework laptops, Raspberry Pi, etc.)",
+      "usage": "imports = [ nixos-hardware.nixosModules.framework-13th-gen-intel ];",
+      "benefit": "Optimal kernel parameters, firmware, and driver configuration for specific devices"
+    },
+    {
+      "concept": "OfBorg CI workflow",
+      "purpose": "Hydra-based CI for nixpkgs pull requests",
+      "mass_rebuild_threshold": ">200 package rebuilds requires staging branch (weekly merge window)",
+      "direct_merge_threshold": "<50 rebuilds can merge directly to master",
+      "validation": "All direct rebuilds must succeed; binary cache hits required for critical packages"
+    },
+    {
+      "concept": "Activation scripts",
+      "generation": "Automatically generated from NixOS module system",
+      "location": "/nix/var/nix/profiles/system-*-link/activate",
+      "purpose": "Idempotent system configuration (users, groups, systemd units, sysctl)",
+      "rollback_mechanism": "nixos-rebuild switch --rollback executes previous generation's activate script"
+    }
+  ],
+  "performance_pitfalls": [
+    {
+      "pitfall": "Quadratic list concatenation",
+      "bad_pattern": "bad = n: if n==0 then [] else bad(n-1)++[n] → O(n²)",
+      "good_pattern": "Accumulate in reverse with single final reverse: go i acc = if i>n then reverse acc else go(i+1)(acc++[i])",
+      "complexity": "O(n) vs O(n²) - 10,000 elements: milliseconds vs seconds"
+    },
+    {
+      "pitfall": "Thunk accumulation (space leaks)",
+      "scenario": "Large folds without forcing intermediate results → OOM",
+      "bad_pattern": "sum = lst: foldl' (acc: x: acc+x) 0 lst on 1M elements",
+      "fix": "Force intermediate: foldl' (acc: x: seq (acc+x) (acc+x)) 0 lst",
+      "mechanism": "builtins.seq evaluates first argument, returns second"
+    },
+    {
+      "pitfall": "Deep attrset nesting",
+      "limit": "Stack depth limit ~10,000 frames applies to attrset nesting depth",
+      "error": "let nest = n: if n==0 then {} else { child = nest(n-1) }; in nest 10001 → stack overflow",
+      "workaround": "Flatten structure or use iterative algorithms"
+    },
+    {
+      "pitfall": "String interpolation quadratic behavior",
+      "bad_pattern": "bad = n: if n==0 then \"\" else bad(n-1)+\"x\" → O(n²)",
+      "good_pattern": "builtins.concatStringsSep \"\" (genList (i: \"x\") n) → O(n)",
+      "impact": "10,000 iterations: seconds vs milliseconds"
+    }
+  ]
+}
